@@ -1,0 +1,242 @@
+---
+title: "BassezMarkdown"
+author: "RhodesFord"
+date: "2024-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.directory <- '~/Documents/SpitzerLab/breastCancerProject/scRNAseq/Bassez/'
+knitr::opts_knit$set(root.dir = set.directory)
+```
+
+## R Markdown
+
+Load any necessary libraries or scripts containing necessary functions
+```{r load libraries, include = FALSE}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(Azimuth)
+library(ggplot2)
+library(patchwork)
+library(reticulate)
+library(pheatmap)
+library(DESeq2)
+library(vidger)
+library(factoextra)
+library(plyr)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(ggrepel)
+
+
+options(future.globals.maxSize = 2e10)
+
+source("~/Documents/SpitzerLab/general_scripts/working_with_10x_data_forRMD.R")
+```
+
+Read in RDS and metadata provided by the authors
+```{r read in}
+cohort1 <- readRDS("TNBC1.rds")
+cohort1 <- CreateSeuratObject(counts = cohort1)
+metadata.cohort1 <- read.csv("cohort1_meta.csv", row.names = 1)
+cohort1@meta.data <- metadata.cohort1
+cohort1@meta.data$orig.ident <- "cohort1"
+
+cohort2 <-readRDS("TNBC.rds")
+metadata.cohort2 <- read.csv("cohort2_meta.csv", row.names = 1)
+cohort2@meta.data <- metadata.cohort2
+cohort2@meta.data$orig.ident <- "cohort2"
+
+bc.list <- list(cohort1, cohort2)
+```
+
+Perform QC filtering and visualization
+```{r qc}
+qc.table <- RunAndVizQC(list.of.seurat.objs = bc.list, 
+                                outputdir = "./"
+                                )
+# Add Pre QC number of Cells Value to table. Change defaults only if data quality suggests it is worth it.
+qc.table$"QC_Filter_nFeature_RNA" <- 200 # default is 200
+qc.table$"QC_Filter_nCount_RNA" <- 20000 # default is 20000
+qc.table$"QC_Filter_percent.mt" <- 10 # default is 10
+
+# rerun RunAndVizQC with info table provided to apply filters
+bc.list <- RunAndVizQC(list.of.seurat.objs = bc.list, 
+                                outputdir = "./",
+                                info.file = qc.table
+                                )
+
+```
+
+Downsample objects to 1000 cells per patient
+```{r downsample}
+DownsampleFunction <- function(patient.id, seurat.obj){
+  seurat.patient <-  which(seurat.obj$patient_id == patient.id)
+    if(length(seurat.patient) > 1000){
+      seurat.down <- sample(seurat.patient, 1000)
+    }
+  else{
+    seurat.down <- seurat.patient
+  }
+}
+
+cohort1 <- bc.list[[1]]
+cohort2 <- bc.list[[2]]
+
+paste("The number of cells in cohort 1 was originally", ncol(cohort1), sep = "")
+paste("The number of cells in cohort 2 was originally", ncol(cohort2), sep = "")
+
+cohort1.patients <- unique(cohort1$patient_id)
+cohort2.patients <- unique(cohort2$patient_id)
+
+cohort1.down <- lapply(cohort1.patients, DownsampleFunction, cohort1)
+cohort2.down <- lapply(cohort2.patients, DownsampleFunction, cohort2)
+
+cohort1.down <- unlist(cohort1.down)
+cohort2.down <- unlist(cohort2.down)
+
+cohort1.down <- cohort1[,labels(cohort1.down)]
+cohort2.down <- cohort2[,labels(cohort2.down)]
+
+paste("The number of cells in cohort 1 is after downsampling", ncol(cohort1.down), sep = "")
+paste("The number of cells in cohort 2 is after downsampling", ncol(cohort2.down), sep = "")
+
+# Merge the two cohorts and save as RDS
+bc.down <- merge(cohort1.down, cohort2.down)
+saveRDS(bc.down, "downsampled_bassez.rds")
+```
+
+Perform SCTransform on raw counts and dimensional reduction with a PCA
+```{r sct and pca}
+bc.down <- readRDS("downsampled_bassez.rds")
+bc.down <- SCTransform(bc.down)
+bc.down <- RunPCA(bc.down, assay = "SCT")
+```
+
+Define clusters in the data using a standard Seurat workflow, modifying the dimensions and resolution to fit data
+```{r clustering}
+bc.down <- FindNeighbors(bc.down, dims = 1:40, reduction = "pca", assay = "SCT")
+bc.down <- FindClusters(bc.down, resolution =0.5, cluster.name = "unintegrated_clusters", assay = "SCT")
+bc.down <- RunUMAP(bc.down, dims = 1:40, reduction = "pca", reduction.name = "unintegrated_clusters", assay = "SCT")
+
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = c("orig.ident", "unintegrated_clusters"))
+```
+
+Explore integration options for the merged data
+```{r compare integration}
+## -----------------------------------------------------------------------------
+## Ultimately, these integration methods had a minimal effect on the data, 
+## indicating that batch correction and other processing may have already been 
+## performed or is unnecessary. Adding in these steps may decrease the biological 
+## resolution of the data.
+## -----------------------------------------------------------------------------
+
+#### INTEGRATE DATA
+# RPCA Integration (fastest, best for big datasets)
+# bc.down <- IntegrateLayers(
+#   object = bc.down, method = RPCAIntegration,
+#   orig.reduction = "pca", new.reduction = "integrated.rpca",
+#   normalization.method = "SCT",
+#   verbose = FALSE
+# )
+# 
+# # Harmony integration (suggested by Sophia)
+# bc.down <- IntegrateLayers(
+#   object = bc.down, method = HarmonyIntegration,
+#   orig.reduction = "pca", new.reduction = "harmony",
+#   normalization.method = "SCT",
+#   verbose = FALSE
+# )
+
+#### CLUSTER INTEGRATED DATA
+# bc.down <- FindNeighbors(bc.down, reduction = "integrated.rpca", dims = 1:30)
+# bc.down <- FindClusters(bc.down, resolution = 0.5, cluster.name = "rpca_clusters")
+# 
+# bc.down <- FindNeighbors(bc.down, reduction = "harmony", dims = 1:30)
+# bc.down <- FindClusters(bc.down, resolution = 0.5, cluster.name = "harmony_clusters")
+# 
+# bc.down <- RunUMAP(bc.down, dims = 1:40, reduction = "integrated.rpca", reduction.name = "rpca.umap")
+# bc.down <- RunUMAP(bc.down, dims = 1:40, reduction = "harmony", reduction.name = "harmony.umap")
+
+#### VISUALIZE INTEGRATED DATA 
+# pdf("UMAPs_integrationCompare.pdf", width = 10, height = 5 )
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = c("orig.ident", "unintegrated_clusters"))
+# DimPlot(bc.down, reduction = "rpca.umap", group.by = c("orig.ident", "rpca_clusters"))
+# DimPlot(bc.down, reduction = "harmony.umap", group.by = c("orig.ident", "harmony_clusters"))
+# dev.off()
+
+# pdf("UMAPs_integrationCompare_patients.pdf", width = 10, height = 5 )
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = "patient_id")
+# DimPlot(bc.down, reduction = "rpca.umap", group.by = "patient_id")
+# DimPlot(bc.down, reduction = "harmony.umap", group.by = "patient_id")
+# dev.off()
+
+# pdf("UMAPs_integrationCompare_celltype.pdf", width = 6, height = 5 )
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = "cellType")
+# DimPlot(bc.down, reduction = "rpca.umap", group.by = "cellType")
+# DimPlot(bc.down, reduction = "harmony.umap", group.by = "cellType")
+# dev.off()
+
+```
+
+Annotate cells using known and published markers for immune and other cells from the tumor microenvironment
+```{r annotate cells}
+# Reference genes taken from Wu et al 2021 "A single-cell and spatially resolved atlas of human breast cancers"
+ref.genes <- c("CD3D", "CD3E", "CD2", "COL1A1", "DCN", "C1R", "LYZ", "CD68", "TYROBP", "CD24", "KRT19", "SCGB2A2", "EPCAM", "CD79A",  "MZB1", "MS4A1", "JCHAIN", "CLDN5", "FLT1", "RAMP2", "PECAM1", "CPA3", "TPSAB1", "TPSB2", "LILRA4", "CXCR3", "IRF7", "HBA1", "HBA2", "HBB")
+
+avg.exp <- AverageExpression(bc.down, features = ref.genes)
+avg.exp <- avg.exp[[2]]
+pdf("AnnotationHeatmap.pdf")
+pheatmap(avg.exp, scale = "row")
+dev.off()
+
+
+
+new.cluster.ids <- c("Fibroblast",
+                     "Myeloid",
+                     "Tcell",
+                     "Tcell",
+                     "CancerCell",
+                     "EndothelialCell",
+                     "Tcell",
+                     "Fibroblast",
+                     "Tcell",
+                     "Tcell",
+                     "Tcell",
+                     "CancerCell",
+                     "Bcell",
+                     "CancerCell",
+                     "CancerCell",
+                     "CancerCell",
+                     "Plasmablast",
+                     "CancerCell",
+                     "CancerCell",
+                     "CancerCell",
+                     "CancerCell",
+                     "CancerCell",
+                     "CancerCell",
+                     "CancerCell",
+                     "RBC",
+                     "MastCell",
+                     "pDC",
+                     "Fibroblast",
+                     "CancerCell")
+
+names(new.cluster.ids) <- levels(bc.down)
+bc.down <- RenameIdents(bc.down,new.cluster.ids)
+
+pdf("RenamedClusters.pdf")
+DimPlot(bc.down, reduction = "unintegrated_clusters")
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = "BC_type")
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = "cohort")
+DimPlot(bc.down, reduction = "unintegrated_clusters", group.by = "timepoint")
+dev.off()
+
+# Save RDS
+saveRDS(bc.down, "BC_down_anno.rds")
+
+```
+

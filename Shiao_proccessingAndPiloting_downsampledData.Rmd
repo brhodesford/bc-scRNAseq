@@ -1,0 +1,264 @@
+---
+title: "Shiao_Analysis"
+author: "RhodesFord"
+date: "2024-10-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.directory <- '~/Documents/SpitzerLab/breastCancerProject/scRNAseq/Shiao/'
+knitr::opts_knit$set(root.dir = set.directory)
+```
+
+Load any necessary libraries or scripts containing necessary functions
+```{r load libraries, include = FALSE}
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(anndata)
+library(Azimuth)
+library(ggplot2)
+library(patchwork)
+library(reticulate)
+library(pheatmap)
+library(DESeq2)
+library(vidger)
+library(factoextra)
+library(plyr)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(ggrepel)
+
+
+options(future.globals.maxSize = 2e10)
+
+source("~/Documents/SpitzerLab/general_scripts/working_with_10x_data_forRMD.R")
+```
+
+Read in *.h5ad files downloaded from GEO
+```{r load in}
+# # *.h5seurat files can't be read in properly, so used the below processing steps instead
+#
+# # read in *.h5seurat files using read_h5ad, rather than Seurat's built in function
+# shiao.imm <- read_h5ad('processedFiles_fromGEO/GSE246613_PembroRT_immune_R100_final.h5ad')
+# shiao.nonimm <- read_h5ad('processedFiles_fromGEO/GSE246613_PembroRT_non_immune_cells.h5ad')
+# 
+# # Create Seurat objects
+# shiao.imm.seurat <- CreateSeuratObject(counts = t(shiao.imm$X), meta.data = shiao.imm$obs)
+# shiao.nonimm.seurat <- CreateSeuratObject(counts = t(shiao.nonimm$X), meta.data = shiao.nonimm$obs)
+# 
+# # Save RDS files 
+# saveRDS(shiao.imm.seurat, "shiao_imm_Seurat.rds")
+# saveRDS(shiao.nonimm.seurat, "shiao_nonimm_Seurat.rds")
+```
+
+Read in already processed RDS (if necessary) and add both objects to list
+```{r read seurat rds}
+shiao.imm.seurat <- readRDS("shiao_imm_Seurat.rds")
+shiao.nonimm.seurat <- readRDS("shiao_nonimm_Seurat.rds")
+
+shiao.list <- list(shiao.imm.seurat, shiao.nonimm.seurat)
+```
+
+Perform QC filtering and visualization
+```{r qc}
+qc.table <- RunAndVizQC(list.of.seurat.objs = shiao.list, 
+                                outputdir = "./"
+                                )
+
+# Add Pre QC number of Cells Value to table. Change defaults only if data quality suggests it is worth it.
+qc.table$"QC_Filter_nFeature_RNA" <- 200 # default is 200
+qc.table$"QC_Filter_nCount_RNA" <- 20000 # default is 20000
+qc.table$"QC_Filter_percent.mt" <- 10 # default is 10
+
+# rerun RunAndVizQC with info table provided to apply filters
+shiao.list <- RunAndVizQC(list.of.seurat.objs = shiao.list, 
+                                outputdir = "./",
+                                info.file = qc.table
+                                )
+
+```
+
+Downsample objects to 500 cells per treatment timepoint per patient (1500 cells per patient)
+```{r downsample}
+DownsampleFunction <- function(patient.id, seurat.obj){
+  seurat.patient <-  which(seurat.obj$patient_treatment == patient.id)
+    if(length(seurat.patient) > 500){
+      seurat.down <- sample(seurat.patient, 500)
+    }
+  else{
+    seurat.down <- seurat.patient
+  }
+}
+
+imm <- shiao.list[[1]]
+nonimm <- shiao.list[[2]]
+imm.patient.treatment <- paste(imm$cohort, imm$treatment, sep = "_")
+nonimm.patient.treatment <- paste(nonimm$cohort, nonimm$treatment, sep = "_")
+imm <- AddMetaData(imm, metadata = imm.patient.treatment, col.name = "patient_treatment")
+nonimm <- AddMetaData(nonimm, metadata = nonimm.patient.treatment, col.name = "patient_treatment")
+
+paste("The number of cells in the immune dataset was originally", ncol(imm), sep = "")
+paste("The number of cells in nonimmune dataset was originally", ncol(nonimm), sep = "")
+
+imm.patients <- unique(imm$patient_treatment)
+nonimm.patients <- unique(nonimm$patient_treatment)
+
+imm.down <- lapply(imm.patients, DownsampleFunction, imm)
+nonimm.down <- lapply(nonimm.patients, DownsampleFunction, nonimm)
+
+imm.down <- unlist(imm.down)
+nonimm.down <- unlist(nonimm.down)
+
+imm.down <- imm[,labels(imm.down)]
+nonimm.down <- nonimm[,labels(nonimm.down)]
+
+paste("The number of cells in the immune dataset is after downsampling", ncol(imm.down), sep = "")
+paste("The number of cells in the nonimmune dataset is after downsampling", ncol(nonimm.down), sep = "")
+
+# make the two objects into a list and save as RDS
+shiao.down.list <- list(imm.down, nonimm.down)
+# saveRDS(shiao.down.list, "downsampled_shiao_list.rds")
+```
+
+Perform SCTransform on raw counts and dimensional reduction with a PCA
+```{r sct and pca}
+shiao.down.list <- readRDS("downsampled_shiao_list.rds")
+shiao.down.list <- lapply(shiao.down.list, function(x){
+  x <- SCTransform(x)
+  x <- RunPCA(x, assay = "SCT")
+  return(x)
+})
+
+# # Save as RDS
+# saveRDS(shiao.down.list, "downsampled_shiao_list_sct.rds")
+```
+
+Define clusters in the data using a standard Seurat workflow, modifying the dimensions and resolution to fit data
+```{r clustering} 
+shiao.down.list <- readRDS("downsampled_shiao_list_sct.rds")
+shiao.down.list[[1]] <- FindNeighbors(shiao.down.list[[1]], dims = 1:30, reduction = "pca", assay = "SCT")
+shiao.down.list[[1]] <- FindClusters(shiao.down.list[[1]], resolution = 1, cluster.name = "umap", assay = "SCT")
+shiao.down.list[[1]] <- RunUMAP(shiao.down.list[[1]], dims = 1:30, reduction = "pca", reduction.name = "umap", assay = "SCT")
+print(DimPlot(shiao.down.list[[1]], reduction = "umap"))
+
+shiao.down.list[[2]] <- FindNeighbors(shiao.down.list[[2]], dims = 1:15, reduction = "pca", assay = "SCT")
+shiao.down.list[[2]] <- FindClusters(shiao.down.list[[2]], resolution =0.5, cluster.name = "umap", assay = "SCT")
+shiao.down.list[[2]] <- RunUMAP(shiao.down.list[[2]], dims = 1:15, reduction = "pca", reduction.name = "umap", assay = "SCT")
+print(DimPlot(shiao.down.list[[2]], reduction = "umap"))
+```
+
+Visualize the distribution of the data by patient ("cohort") and by treatment
+```{r visualize}
+DimPlot(shiao.down.list[[1]], reduction = "umap", group.by = "cohort")
+DimPlot(shiao.down.list[[2]], reduction = "umap", group.by = "cohort")
+
+DimPlot(shiao.down.list[[1]], reduction = "umap", group.by = "treatment")
+DimPlot(shiao.down.list[[2]], reduction = "umap", group.by = "treatment")
+```
+
+Save or read RDS at this processing stage
+```{r}
+saveRDS(shiao.down.list, "downsampled_shiao_list_norm_reduct.rds")
+shiao.down.list <- readRDS("downsampled_shiao_list_norm_reduct.rds")
+```
+
+Annotate cells using known and published markers for immune and other cells from the tumor microenvironment
+```{r annotate cells}
+# Reference genes taken from Wu et al 2021 "A single-cell and spatially resolved atlas of human breast cancers"
+imm.genes <- c("CD3D", "CD3E", "CD2", "LYZ", "CD68", "TYROBP", "CD79A",  "MZB1", "MS4A1", "JCHAIN", "TPSAB1", "TPSB2", "CPA3", "NCAM1", "KLRB1")
+nonimm.genes <- c("COL1A1", "DCN", "C1R", "CD24", "KRT19", "SCGB2A2", "EPCAM", "CLDN5", "FLT1", "RAMP2", "PECAM1", "TPSAB1", "TPSB2", "CPA3")
+
+imm.exp <- AverageExpression(shiao.down.list[[1]], features = imm.genes)
+imm.exp <- imm.exp[[2]]
+
+nonimm.exp <- AverageExpression(shiao.down.list[[2]], features = nonimm.genes)
+nonimm.exp <- nonimm.exp[[2]]
+
+pdf("AnnotationHeatmap_Imm.pdf")
+print(pheatmap(imm.exp, scale = "row"))
+dev.off()
+
+pdf("AnnotationHeatmap_Nonimm.pdf")
+print(pheatmap(nonimm.exp, scale = "row"))
+dev.off()
+
+imm.new.cluster.ids <- c("Tcell", #0
+                     "Tcell", #1
+                     "NKcell", #2
+                     "Tcell", #3
+                     "Myeloid", #4
+                     "Myeloid", #5
+                     "Tcell", #6
+                     "Tcell", #7
+                     "Tcell", #8
+                     "Myeloid", #9
+                     "Myeloid", #10
+                     "Bcell", #11
+                     "Myeloid", #12
+                     "NKcell", #13
+                     "NKcell", #14
+                     "Myeloid", #15
+                     "Tcell", #16
+                     "Myeloid", #17
+                     "Bcell", #18
+                     "Tcell", #19
+                     "Plasmablast", #20
+                     "Bcell", #21
+                     "Bcell", #22
+                     "Myeloid", #23
+                     "Tcell", #24
+                     "Bcell", #25
+                     "Plasmablast", #26
+                     "Mast", #27
+                     "Tcell" #28
+                     )
+
+
+nonimm.new.cluster.ids <- c("Fibroblast", #0
+                     "Fibroblast", #1
+                     "Endothelial", #2
+                     "Cancer", #3
+                     "Cancer", #4
+                     "Fibroblast", #5
+                     "Endothelial", #6
+                     "Cancer", #7
+                     "Cancer", #8
+                     "Cancer", #9
+                     "Cancer", #10
+                     "Cancer", #11
+                     "Cancer", #12
+                     "Cancer", #13
+                     "Cancer", #14
+                     "Fibroblast", #15
+                     "Mast", #16
+                     "Endothelial", #17
+                     "Endothelial", #18
+                     "Cancer", #19
+                     "Cancer", #20
+                     "Fibroblast", #21
+                     "Fibroblast", #22
+                     "Cancer", #23
+                     "Cancer" #24
+                     )
+
+names(imm.new.cluster.ids) <- levels(shiao.down.list[[1]])
+shiao.down.list[[1]] <- RenameIdents(shiao.down.list[[1]],imm.new.cluster.ids)
+
+pdf("RenamedClusters_Imm.pdf")
+DimPlot(shiao.down.list[[1]], reduction = "umap")
+dev.off
+
+names(nonimm.new.cluster.ids) <- levels(shiao.down.list[[2]])
+shiao.down.list[[2]] <- RenameIdents(shiao.down.list[[2]], nonimm.new.cluster.ids)
+
+pdf("RenamedClusters_Nonimm.pdf")
+DimPlot(shiao.down.list[[2]], reduction = "umap")
+dev.off
+
+# Save RDS
+saveRDS(shiao.down.list, "shiao_down_anno.rds")
+
+```
